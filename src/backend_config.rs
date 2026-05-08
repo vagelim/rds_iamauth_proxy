@@ -1,3 +1,5 @@
+use std::io::BufReader;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -11,19 +13,23 @@ use aws_sigv4::sign::v4;
 use bytes::{Bytes, BytesMut};
 use eyre::{eyre, Result};
 use futures::SinkExt;
-use postgres_native_tls::TlsConnector;
-use postgres_native_tls::TlsStream;
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
+use rustls::pki_types::ServerName;
+use rustls::ClientConfig;
+use rustls::RootCertStore;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio_postgres::tls::TlsConnect;
 use tokio_stream::StreamExt;
 use tokio_util::codec::BytesCodec;
 use tokio_util::codec::Framed;
+
+/// The RDS global CA bundle, embedded at compile time.
+/// Downloaded from https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+const RDS_GLOBAL_BUNDLE_PEM: &[u8] = include_bytes!("../certs/global-bundle.pem");
 
 #[derive(Debug)]
 pub struct DbSpec {
@@ -58,6 +64,26 @@ impl Addr {
     }
 }
 
+/// Build a rustls RootCertStore from a PEM bundle.
+fn build_root_cert_store(pem_data: &[u8]) -> Result<RootCertStore> {
+    let mut root_store = RootCertStore::empty();
+    let mut reader = BufReader::new(pem_data);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .map_err(|e| eyre!("Failed to parse PEM certificates: {}", e))?;
+
+    if certs.is_empty() {
+        return Err(eyre!("No certificates found in PEM bundle"));
+    }
+
+    for cert in certs {
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(cert))
+            .map_err(|e| eyre!("Failed to add certificate to root store: {}", e))?;
+    }
+
+    Ok(root_store)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct BackendConfig {
     endpoint: Addr,
@@ -73,7 +99,10 @@ impl BackendConfig {
         }
     }
 
-    pub async fn get_server_conn(&self, db_spec: DbSpec) -> Result<TlsStream<TcpStream>> {
+    pub async fn get_server_conn(
+        &self,
+        db_spec: DbSpec,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let password = get_rds_password(
             self.endpoint.hostname.as_ref(),
             self.endpoint.port,
@@ -89,32 +118,36 @@ impl BackendConfig {
         &self,
         db_spec: DbSpec,
         password: String,
-    ) -> Result<TlsStream<TcpStream>> {
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let stream = TcpStream::connect(self.connect_endpoint().connect_str()).await?;
         let mut tls_stream = self.upgrade_to_tls(stream).await?;
         send_password(&db_spec, &mut tls_stream, password).await?;
         Ok(tls_stream)
     }
 
-    async fn upgrade_to_tls<S>(&self, mut tcp: S) -> Result<TlsStream<S>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + 'static + Send,
-    {
+    async fn upgrade_to_tls(
+        &self,
+        mut tcp: TcpStream,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let mut buf = BytesMut::new();
         frontend::ssl_request(&mut buf);
         tcp.write_all(&buf).await?;
         let mut buf = [0];
         tcp.read_exact(&mut buf).await?;
         if buf[0] != b'S' {
-            Err(eyre!("server does not support TLS"))
-        } else {
-            let native_conn = native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?;
-            let tls = TlsConnector::new(native_conn, self.endpoint.hostname.as_ref());
-            let stream = tls.connect(tcp).await?;
-            Ok(stream)
+            return Err(eyre!("server does not support TLS"));
         }
+
+        let root_store = build_root_cert_store(RDS_GLOBAL_BUNDLE_PEM)?;
+        let tls_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let server_name = ServerName::try_from(self.endpoint.hostname.clone())
+            .map_err(|e| eyre!("Invalid server name '{}': {}", self.endpoint.hostname, e))?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let stream = connector.connect(server_name, tcp).await?;
+        Ok(stream)
     }
 }
 

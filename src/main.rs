@@ -13,7 +13,7 @@ use config::File;
 use eyre::{eyre, Result};
 use futures::SinkExt;
 use memchr::memchr;
-use postgres_native_tls::TlsStream;
+use tokio_rustls::client::TlsStream;
 use tokio::io::split;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -29,6 +29,13 @@ use backend_config::BackendConfig;
 use backend_config::DbSpec;
 
 fn setup() -> Result<()> {
+    // Install the ring crypto provider for rustls before anything else uses it.
+    // This is required because multiple crates (our TLS code, aws-sdk-signin)
+    // depend on rustls but with different feature flags.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls ring crypto provider");
+
     if std::env::var("RUST_LIB_BACKTRACE").is_err() {
         std::env::set_var("RUST_LIB_BACKTRACE", "1")
     }
