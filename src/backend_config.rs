@@ -126,7 +126,7 @@ pub async fn get_rds_password(
     region_name: &str,
     username: &str,
 ) -> Result<String> {
-    let config = aws_config::load_defaults(BehaviorVersion::v2023_11_09()).await;
+    let config = aws_config::load_defaults(BehaviorVersion::v2024_03_28()).await;
     let provider = config
         .credentials_provider()
         .ok_or(eyre!("no credentials provider found"))?;
