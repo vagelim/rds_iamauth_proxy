@@ -27,6 +27,7 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_stream::StreamExt;
+use tracing::warn;
 use tokio_util::codec::BytesCodec;
 use tokio_util::codec::Framed;
 
@@ -92,6 +93,14 @@ pub struct BackendConfig {
     endpoint: Addr,
     region: String,
     proxy_endpoint: Option<Addr>,
+    /// Path to a custom CA bundle PEM file. When set, this is used instead of
+    /// the embedded RDS global bundle to validate the server certificate.
+    ca_bundle: Option<String>,
+    /// Skip TLS certificate validation entirely. Only intended for use with
+    /// SSH tunnels to localhost where the certificate hostname will not match.
+    /// Defaults to false.
+    #[serde(default)]
+    danger_accept_invalid_certs: bool,
 }
 
 impl BackendConfig {
@@ -141,16 +150,73 @@ impl BackendConfig {
             return Err(eyre!("server does not support TLS"));
         }
 
-        let root_store = build_root_cert_store(RDS_GLOBAL_BUNDLE_PEM)?;
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let tls_config = if self.danger_accept_invalid_certs {
+            warn!(
+                "TLS certificate validation is disabled (danger_accept_invalid_certs=true). \
+                 This should only be used with SSH tunnels to localhost."
+            );
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(DangerousVerifier))
+                .with_no_client_auth()
+        } else {
+            let pem_data = match &self.ca_bundle {
+                Some(path) => std::fs::read(path)
+                    .map_err(|e| eyre!("Failed to read CA bundle from '{}': {}", path, e))?,
+                None => RDS_GLOBAL_BUNDLE_PEM.to_vec(),
+            };
+            let root_store = build_root_cert_store(&pem_data)?;
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
 
         let server_name = ServerName::try_from(self.endpoint.hostname.clone())
             .map_err(|e| eyre!("Invalid server name '{}': {}", self.endpoint.hostname, e))?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
         let stream = connector.connect(server_name, tcp).await?;
         Ok(stream)
+    }
+}
+
+/// A certificate verifier that accepts any certificate (for danger_accept_invalid_certs).
+#[derive(Debug)]
+struct DangerousVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for DangerousVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
