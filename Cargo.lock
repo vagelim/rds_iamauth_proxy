@@ -2075,6 +2075,7 @@ dependencies = [
  "color-eyre",
  "config",
  "eyre",
+ "fallible-iterator",
  "futures",
  "memchr",
  "postgres-protocol",

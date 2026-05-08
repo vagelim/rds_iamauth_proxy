@@ -12,7 +12,10 @@ use aws_sigv4::http_request::SigningSettings;
 use aws_sigv4::sign::v4;
 use bytes::{Bytes, BytesMut};
 use eyre::{eyre, Result};
+use fallible_iterator::FallibleIterator;
 use futures::SinkExt;
+use postgres_protocol::authentication::sasl;
+use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use rustls::pki_types::ServerName;
@@ -205,16 +208,94 @@ where
     let buf = db_spec.startup_message()?;
     let mut framed = Framed::new(stream, BytesCodec::new());
     framed.send(buf).await?;
-    if let Some(mut resp) = framed.try_next().await? {
-        if let Ok(Some(Message::AuthenticationCleartextPassword)) = Message::parse(&mut resp) {
+
+    let mut resp = framed
+        .try_next()
+        .await?
+        .ok_or_else(|| eyre!("backend closed connection before auth"))?;
+
+    match Message::parse(&mut resp)? {
+        Some(Message::AuthenticationCleartextPassword) => {
             let mut pw_buf = BytesMut::new();
             frontend::password_message(password.as_ref(), &mut pw_buf)?;
             framed.send(pw_buf.freeze()).await?;
             Ok(())
-        } else {
-            Err(eyre!("Unexpected auth prompt"))
         }
-    } else {
-        Err(eyre!("Unexpected backed message"))
+        Some(Message::AuthenticationSasl(body)) => {
+            // Check that SCRAM-SHA-256 is offered
+            let mut has_scram = false;
+            let mut mechanisms = body.mechanisms();
+            while let Some(mechanism) = mechanisms.next()? {
+                if mechanism == sasl::SCRAM_SHA_256 {
+                    has_scram = true;
+                }
+            }
+            if !has_scram {
+                return Err(eyre!(
+                    "Server offered SASL auth but SCRAM-SHA-256 is not available"
+                ));
+            }
+
+            // Step 1: Send SASLInitialResponse with client-first-message
+            let mut scram = ScramSha256::new(password.as_bytes(), ChannelBinding::unsupported());
+            let mut sasl_buf = BytesMut::new();
+            frontend::sasl_initial_response(sasl::SCRAM_SHA_256, scram.message(), &mut sasl_buf)?;
+            framed.send(sasl_buf.freeze()).await?;
+
+            // Step 2: Receive AuthenticationSASLContinue, send SASLResponse
+            let mut resp = framed
+                .try_next()
+                .await?
+                .ok_or_else(|| eyre!("backend closed connection during SASL"))?;
+            match Message::parse(&mut resp)? {
+                Some(Message::AuthenticationSaslContinue(body)) => {
+                    scram
+                        .update(body.data())
+                        .map_err(|e| eyre!("SCRAM update failed: {}", e))?;
+                }
+                _ => return Err(eyre!("Expected AuthenticationSASLContinue")),
+            }
+
+            let mut sasl_buf = BytesMut::new();
+            frontend::sasl_response(scram.message(), &mut sasl_buf)?;
+            framed.send(sasl_buf.freeze()).await?;
+
+            // Step 3: Receive AuthenticationSASLFinal or AuthenticationOk
+            let mut resp = framed
+                .try_next()
+                .await?
+                .ok_or_else(|| eyre!("backend closed connection during SASL final"))?;
+            let raw_snapshot = resp.clone();
+            match Message::parse(&mut resp)? {
+                Some(Message::AuthenticationSaslFinal(body)) => {
+                    scram
+                        .finish(body.data())
+                        .map_err(|e| eyre!("SCRAM verification failed: {}", e))?;
+                }
+                Some(Message::AuthenticationOk) => {
+                    // Some servers skip SASLFinal and go straight to Ok
+                }
+                Some(Message::ErrorResponse(_)) => {
+                    let raw_str = String::from_utf8_lossy(&raw_snapshot);
+                    return Err(eyre!(
+                        "Backend error after SASL response: {}",
+                        raw_str
+                    ));
+                }
+                _ => {
+                    return Err(eyre!(
+                        "Expected AuthenticationSASLFinal or AuthenticationOk (raw: {:?})",
+                        &raw_snapshot[..std::cmp::min(raw_snapshot.len(), 128)]
+                    ));
+                }
+            }
+
+            Ok(())
+        }
+        Some(Message::ErrorResponse(_)) => Err(eyre!(
+            "Backend returned error during auth (raw: {:?})",
+            &resp[..std::cmp::min(resp.len(), 128)]
+        )),
+        _ => Err(eyre!("Unsupported authentication method")),
     }
 }
