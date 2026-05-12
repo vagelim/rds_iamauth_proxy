@@ -101,9 +101,18 @@ pub struct BackendConfig {
     /// Defaults to false.
     #[serde(default)]
     danger_accept_invalid_certs: bool,
+    /// Optional local password that clients must provide to connect through the
+    /// proxy. When set, the proxy validates the client's password before
+    /// forwarding the connection to RDS. This prevents unauthorized localhost
+    /// users from accessing the database.
+    local_password: Option<String>,
 }
 
 impl BackendConfig {
+    pub fn local_password(&self) -> Option<&str> {
+        self.local_password.as_deref()
+    }
+
     fn connect_endpoint(&self) -> &Addr {
         match self.proxy_endpoint {
             Some(ref proxy) => proxy,

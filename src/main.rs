@@ -105,6 +105,85 @@ fn parse_startup(src: Bytes) -> Result<DbSpec> {
     Ok(db)
 }
 
+/// Send a PostgreSQL ErrorResponse to the client.
+async fn send_pg_error(
+    framed: &mut tokio_util::codec::Framed<&mut TcpStream, BytesCodec>,
+    code: &str,
+    message: &str,
+) -> Result<()> {
+    use bytes::BufMut;
+    let mut buf = bytes::BytesMut::new();
+    let severity = b"ERROR";
+    let body_len = 1 + severity.len() + 1
+        + 1 + code.len() + 1
+        + 1 + message.len() + 1
+        + 1;
+    buf.put_u8(b'E');
+    buf.put_i32((body_len + 4) as i32);
+    buf.put_u8(b'S');
+    buf.put_slice(severity);
+    buf.put_u8(0);
+    buf.put_u8(b'C');
+    buf.put_slice(code.as_bytes());
+    buf.put_u8(0);
+    buf.put_u8(b'M');
+    buf.put_slice(message.as_bytes());
+    buf.put_u8(0);
+    buf.put_u8(0);
+    framed.send(buf.freeze()).await?;
+    Ok(())
+}
+
+/// Ask the PostgreSQL client for a cleartext password and verify it against
+/// the configured local_password.
+async fn verify_pg_local_password(
+    framed: &mut tokio_util::codec::Framed<&mut TcpStream, BytesCodec>,
+    expected: &str,
+) -> Result<()> {
+    use bytes::BufMut;
+
+    // Send AuthenticationCleartextPassword: 'R' + int32(8) + int32(3)
+    let mut auth_req = bytes::BytesMut::with_capacity(9);
+    auth_req.put_u8(b'R');
+    auth_req.put_i32(8);
+    auth_req.put_i32(3);
+    framed.send(auth_req.freeze()).await?;
+
+    // Read PasswordMessage: 'p' + int32(len) + string\0
+    let resp = framed
+        .try_next()
+        .await?
+        .ok_or_else(|| eyre!("Client closed before sending password"))?;
+
+    if resp.is_empty() || resp[0] != b'p' {
+        send_pg_error(framed, "28P01", "Expected password message").await?;
+        return Err(eyre!("Expected PasswordMessage, got {:?}", resp.first()));
+    }
+
+    if resp.len() < 5 {
+        send_pg_error(framed, "28P01", "Malformed password message").await?;
+        return Err(eyre!("Password message too short"));
+    }
+
+    let password_bytes = &resp[5..];
+    let password = if password_bytes.last() == Some(&0) {
+        &password_bytes[..password_bytes.len() - 1]
+    } else {
+        password_bytes
+    };
+
+    let password_str = std::str::from_utf8(password)
+        .map_err(|_| eyre!("Password is not valid UTF-8"))?;
+
+    if password_str != expected {
+        send_pg_error(framed, "28P01", "Invalid local proxy password").await?;
+        return Err(eyre!("Local password mismatch"));
+    }
+
+    info!("Local password verified");
+    Ok(())
+}
+
 async fn auth_backend(
     config: &BackendConfig,
     client: &mut TcpStream,
@@ -129,6 +208,12 @@ async fn auth_backend(
                             ));
                         }
                         let db = parse_startup(bytes.split_off(8).freeze())?;
+
+                        // Verify local password if configured
+                        if let Some(expected) = config.local_password() {
+                            verify_pg_local_password(&mut framed, expected).await?;
+                        }
+
                         let server = config.get_server_conn(db).await?;
                         return Ok(server);
                     } else {
