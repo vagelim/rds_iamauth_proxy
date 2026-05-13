@@ -527,8 +527,20 @@ fn build_err_packet(error_code: u16, sql_state: &str, message: &str) -> Vec<u8> 
     buf
 }
 
-/// Parse the client's HandshakeResponse41 to extract username and database.
-fn parse_client_handshake(payload: &[u8]) -> Result<(String, String, u32)> {
+/// Parsed fields from a client HandshakeResponse41.
+struct ClientHandshake {
+    username: String,
+    database: String,
+    /// The raw auth response bytes sent by the client (the password for
+    /// mysql_clear_password). May include a trailing NUL.
+    auth_data: Vec<u8>,
+    #[allow(dead_code)]
+    client_flags: u32,
+}
+
+/// Parse the client's HandshakeResponse41 to extract username, database,
+/// and auth data (password).
+fn parse_client_handshake(payload: &[u8]) -> Result<ClientHandshake> {
     let mut buf = BytesMut::from(payload);
     if buf.remaining() < 32 {
         return Err(eyre!("Client handshake too short: {} bytes", buf.remaining()));
@@ -547,26 +559,33 @@ fn parse_client_handshake(payload: &[u8]) -> Result<(String, String, u32)> {
     let username = String::from_utf8_lossy(&buf[..username_end]).to_string();
     buf.advance(username_end + 1);
 
-    // Auth response — skip it (we don't need the client's password attempt;
-    // we generate our own IAM token)
-    if client_flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
-        // Length-encoded auth data
+    // Auth response — extract it (used for local_password verification)
+    let auth_data = if client_flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
         let auth_len = read_lenenc_int(&mut buf)?;
-        let skip = std::cmp::min(auth_len as usize, buf.remaining());
-        buf.advance(skip);
+        let take = std::cmp::min(auth_len as usize, buf.remaining());
+        let data = buf[..take].to_vec();
+        buf.advance(take);
+        data
     } else if client_flags & CLIENT_SECURE_CONNECTION != 0 {
-        // 1-byte length-prefixed auth data
         if buf.has_remaining() {
             let auth_len = buf.get_u8() as usize;
-            let skip = std::cmp::min(auth_len, buf.remaining());
-            buf.advance(skip);
+            let take = std::cmp::min(auth_len, buf.remaining());
+            let data = buf[..take].to_vec();
+            buf.advance(take);
+            data
+        } else {
+            vec![]
         }
     } else {
         // Null-terminated auth data
         if let Some(pos) = buf.iter().position(|&b| b == 0) {
+            let data = buf[..pos].to_vec();
             buf.advance(pos + 1);
+            data
+        } else {
+            vec![]
         }
-    }
+    };
 
     // Database (null-terminated) if CLIENT_CONNECT_WITH_DB
     let database = if client_flags & CLIENT_CONNECT_WITH_DB != 0 && buf.has_remaining() {
@@ -580,7 +599,12 @@ fn parse_client_handshake(payload: &[u8]) -> Result<(String, String, u32)> {
         String::new()
     };
 
-    Ok((username, database, client_flags))
+    Ok(ClientHandshake {
+        username,
+        database,
+        auth_data,
+        client_flags,
+    })
 }
 
 /// Read a length-encoded integer from the buffer.
@@ -668,20 +692,41 @@ pub async fn mysql_handle_client(
         }
     }
 
-    let (username, database, _client_flags) = parse_client_handshake(&client_payload)?;
+    let handshake_resp = parse_client_handshake(&client_payload)?;
     info!(
         "MySQL client auth: user={}, database={}",
-        username, database
+        handshake_resp.username, handshake_resp.database
     );
 
-    if username.is_empty() {
+    if handshake_resp.username.is_empty() {
         let err = build_err_packet(1045, "28000", "Username is required");
         write_packet(&mut client, seq_id + 1, &err).await?;
         return Err(eyre!("Client did not provide a username"));
     }
 
+    // Verify local password if configured
+    if let Some(expected) = config.local_password() {
+        // The auth_data from mysql_clear_password is the password + NUL.
+        // Strip trailing NUL for comparison.
+        let client_pw = {
+            let raw = &handshake_resp.auth_data;
+            if raw.last() == Some(&0) {
+                &raw[..raw.len() - 1]
+            } else {
+                raw.as_slice()
+            }
+        };
+        let client_pw_str = std::str::from_utf8(client_pw).unwrap_or("");
+        if client_pw_str != expected {
+            let err = build_err_packet(1045, "28000", "Invalid local proxy password");
+            write_packet(&mut client, seq_id + 1, &err).await?;
+            return Err(eyre!("Local password mismatch"));
+        }
+        info!("Local password verified");
+    }
+
     // Step 3: Connect to RDS MySQL backend
-    let db_spec = DbSpec::new(username, database);
+    let db_spec = DbSpec::new(handshake_resp.username, handshake_resp.database);
     let server = match config.get_server_conn(db_spec).await {
         Ok(s) => s,
         Err(e) => {

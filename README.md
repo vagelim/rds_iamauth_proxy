@@ -165,6 +165,7 @@ mysql -h 127.0.0.1 -P 3435 -u iamdb --enable-cleartext-plugin mydb
 | `proxy_endpoint.port` | number | — | Port for proxy_endpoint |
 | `ca_bundle` | string | — | Path to custom CA bundle PEM file (defaults to embedded RDS global bundle) |
 | `danger_accept_invalid_certs` | bool | `false` | Skip TLS cert validation — only use with localhost SSM tunnels |
+| `local_password` | string | — | Password clients must provide to connect through the proxy (see below) |
 
 ## Default Listen Ports
 
@@ -177,6 +178,36 @@ Override with `--listen`:
 ```sh
 rds_proxy --config my-config.json --listen 127.0.0.1:9999
 ```
+
+## Local Password Protection
+
+By default, anyone who can reach the proxy's listen port can connect through it
+to your RDS instance. Set `local_password` in your config to require clients to
+authenticate before the proxy will forward the connection:
+
+```json
+{
+  "endpoint": { "hostname": "...", "port": 3306 },
+  "region": "us-east-2",
+  "db_type": "mysql",
+  "local_password": "my-secret-password"
+}
+```
+
+Clients then provide this password when connecting:
+
+**MySQL:**
+```sh
+mysql -h 127.0.0.1 -P 3435 -u iamdb -p'my-secret-password' --enable-cleartext-plugin mydb
+```
+
+**PostgreSQL:**
+```sh
+PGPASSWORD=my-secret-password psql -h 127.0.0.1 -p 5435 -U iamdb -d mydb
+```
+
+This password is only used for the local client-to-proxy connection. The
+proxy still authenticates to RDS using a separate IAM token.
 
 ## Setting Up an IAM Database User
 
