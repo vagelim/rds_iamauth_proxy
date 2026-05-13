@@ -13,7 +13,6 @@ use config::File;
 use eyre::{eyre, Result};
 use futures::SinkExt;
 use memchr::memchr;
-use tokio_rustls::client::TlsStream;
 use tokio::io::split;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -25,8 +24,11 @@ use tracing::{debug, info};
 use tracing_subscriber::filter::EnvFilter;
 
 mod backend_config;
+mod mysql_backend;
 use backend_config::BackendConfig;
+use backend_config::BackendStream;
 use backend_config::DbSpec;
+use backend_config::DbType;
 
 fn setup() -> Result<()> {
     // Install the ring crypto provider for rustls before anything else uses it.
@@ -187,7 +189,7 @@ async fn verify_pg_local_password(
 async fn auth_backend(
     config: &BackendConfig,
     client: &mut TcpStream,
-) -> Result<TlsStream<TcpStream>> {
+) -> Result<BackendStream> {
     let mut framed = BytesCodec::new().framed(client);
     while let Some(message) = framed.next().await {
         match message {
@@ -251,21 +253,48 @@ async fn handle_client(
     Ok(())
 }
 
+/// Handle a MySQL client connection by delegating to the MySQL backend module.
+async fn handle_mysql_client(
+    config: &BackendConfig,
+    client: TcpStream,
+    _addr: SocketAddr,
+    connection_id: u32,
+) -> Result<()> {
+    mysql_backend::mysql_handle_client(config, client, connection_id).await
+}
+
 async fn run_proxy(config: BackendConfig, listen_address: &str) -> Result<()> {
     let listener = TcpListener::bind(listen_address).await?;
-    info!("Listening on {listen_address}");
+    let is_mysql = *config.db_type() == DbType::Mysql;
+    let protocol = if is_mysql { "MySQL" } else { "PostgreSQL" };
+    info!("Listening on {listen_address} ({protocol} mode)");
+
+    let connection_counter = std::sync::atomic::AtomicU32::new(1);
+
     loop {
         let (stream, addr) = listener.accept().await?;
 
-        info!("Got connection");
+        info!("Got connection from {addr}");
         let config_copy = config.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(&config_copy, stream, addr).await {
-                info!("An error occurred in a client {:?}", e);
-            } else {
-                info!("done with client");
-            }
-        });
+
+        if is_mysql {
+            let conn_id = connection_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::spawn(async move {
+                if let Err(e) = handle_mysql_client(&config_copy, stream, addr, conn_id).await {
+                    info!("MySQL client error: {:?}", e);
+                } else {
+                    info!("MySQL client disconnected");
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = handle_client(&config_copy, stream, addr).await {
+                    info!("PostgreSQL client error: {:?}", e);
+                } else {
+                    info!("PostgreSQL client disconnected");
+                }
+            });
+        }
     }
 }
 
@@ -286,19 +315,26 @@ async fn main() -> Result<()> {
         .author("Greg Soltis <greg@goldfiglabs.com")
         .arg(arg!(-c --config <CONFIG> "Sets the proxy config file to use").default_value("proxy"))
         .arg(
-            arg!(-l --listen <LISTEN> "Sets the address to listen on")
-                .default_value("127.0.0.1:5435"),
+            arg!(-l --listen <LISTEN> "Sets the address to listen on (default: 127.0.0.1:5435 for postgres, 127.0.0.1:3435 for mysql)")
+                .required(false),
         )
         .get_matches();
 
     let config_file = matches.get_one::<String>("config").unwrap();
-    let listen_address = matches.get_one::<String>("listen").unwrap();
-
     let backend_config = load_config(config_file)?;
+
+    let default_listen = match backend_config.db_type() {
+        DbType::Mysql => "127.0.0.1:3435".to_string(),
+        DbType::Postgres => "127.0.0.1:5435".to_string(),
+    };
+    let listen_address = matches
+        .get_one::<String>("listen")
+        .cloned()
+        .unwrap_or(default_listen);
 
     // Run the proxy until we either get a Ctrl-C event or the proxy fails
     tokio::select! {
-        _ = run_proxy(backend_config, listen_address) => {}
+        _ = run_proxy(backend_config, &listen_address) => {}
         _ = signal::ctrl_c() => {}
     }
 

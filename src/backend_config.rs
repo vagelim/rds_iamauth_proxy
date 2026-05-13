@@ -31,6 +31,66 @@ use tracing::warn;
 use tokio_util::codec::BytesCodec;
 use tokio_util::codec::Framed;
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use crate::mysql_backend;
+
+#[derive(Clone, Debug, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DbType {
+    #[default]
+    Postgres,
+    Mysql,
+}
+
+/// A unified stream type that wraps either a PostgreSQL or MySQL backend
+/// connection. Both variants are TLS streams over TCP.
+pub enum BackendStream {
+    Postgres(tokio_rustls::client::TlsStream<TcpStream>),
+    Mysql(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl AsyncRead for BackendStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            BackendStream::Postgres(s) => Pin::new(s).poll_read(cx, buf),
+            BackendStream::Mysql(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for BackendStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            BackendStream::Postgres(s) => Pin::new(s).poll_write(cx, buf),
+            BackendStream::Mysql(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            BackendStream::Postgres(s) => Pin::new(s).poll_flush(cx),
+            BackendStream::Mysql(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            BackendStream::Postgres(s) => Pin::new(s).poll_shutdown(cx),
+            BackendStream::Mysql(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 /// The RDS global CA bundle, embedded at compile time.
 /// Downloaded from https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 const RDS_GLOBAL_BUNDLE_PEM: &[u8] = include_bytes!("../certs/global-bundle.pem");
@@ -44,6 +104,14 @@ pub struct DbSpec {
 impl DbSpec {
     pub fn new(user: String, database: String) -> DbSpec {
         DbSpec { user, database }
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub fn database(&self) -> &str {
+        &self.database
     }
 
     fn startup_message(&self) -> Result<Bytes> {
@@ -106,6 +174,9 @@ pub struct BackendConfig {
     /// forwarding the connection to RDS. This prevents unauthorized localhost
     /// users from accessing the database.
     local_password: Option<String>,
+    /// Database type: "postgres" (default) or "mysql".
+    #[serde(default)]
+    db_type: DbType,
 }
 
 impl BackendConfig {
@@ -120,10 +191,15 @@ impl BackendConfig {
         }
     }
 
-    pub async fn get_server_conn(
-        &self,
-        db_spec: DbSpec,
-    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    pub fn db_type(&self) -> &DbType {
+        &self.db_type
+    }
+
+    pub fn connect_str(&self) -> String {
+        self.connect_endpoint().connect_str()
+    }
+
+    pub async fn get_server_conn(&self, db_spec: DbSpec) -> Result<BackendStream> {
         let password = get_rds_password(
             self.endpoint.hostname.as_ref(),
             self.endpoint.port,
@@ -131,11 +207,20 @@ impl BackendConfig {
             db_spec.user.as_str(),
         )
         .await?;
-        let stream = self.backend_conn(db_spec, password).await?;
-        Ok(stream)
+
+        match self.db_type {
+            DbType::Postgres => {
+                let stream = self.pg_backend_conn(db_spec, password).await?;
+                Ok(BackendStream::Postgres(stream))
+            }
+            DbType::Mysql => {
+                let stream = mysql_backend::mysql_connect(self, &db_spec, &password).await?;
+                Ok(BackendStream::Mysql(stream))
+            }
+        }
     }
 
-    async fn backend_conn(
+    async fn pg_backend_conn(
         &self,
         db_spec: DbSpec,
         password: String,
@@ -146,6 +231,8 @@ impl BackendConfig {
         Ok(tls_stream)
     }
 
+    /// Upgrade a TCP connection to TLS using PostgreSQL's SSL negotiation.
+    /// For MySQL, use `upgrade_to_tls_raw` which skips the PG SSL request/response.
     async fn upgrade_to_tls(
         &self,
         mut tcp: TcpStream,
@@ -159,6 +246,41 @@ impl BackendConfig {
             return Err(eyre!("server does not support TLS"));
         }
 
+        let tls_config = if self.danger_accept_invalid_certs {
+            warn!(
+                "TLS certificate validation is disabled (danger_accept_invalid_certs=true). \
+                 This should only be used with SSH tunnels to localhost."
+            );
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(DangerousVerifier))
+                .with_no_client_auth()
+        } else {
+            let pem_data = match &self.ca_bundle {
+                Some(path) => std::fs::read(path)
+                    .map_err(|e| eyre!("Failed to read CA bundle from '{}': {}", path, e))?,
+                None => RDS_GLOBAL_BUNDLE_PEM.to_vec(),
+            };
+            let root_store = build_root_cert_store(&pem_data)?;
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+
+        let server_name = ServerName::try_from(self.endpoint.hostname.clone())
+            .map_err(|e| eyre!("Invalid server name '{}': {}", self.endpoint.hostname, e))?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let stream = connector.connect(server_name, tcp).await?;
+        Ok(stream)
+    }
+
+    /// Perform TLS upgrade on a raw TCP stream without any protocol-level
+    /// negotiation (no PostgreSQL SSLRequest). MySQL handles SSL negotiation
+    /// at the MySQL protocol level before calling this.
+    pub async fn upgrade_to_tls_raw(
+        &self,
+        tcp: TcpStream,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let tls_config = if self.danger_accept_invalid_certs {
             warn!(
                 "TLS certificate validation is disabled (danger_accept_invalid_certs=true). \
