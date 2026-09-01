@@ -1,0 +1,8 @@
+{
+  "endpoint": {
+    "hostname": "your-mysql-instance.abcdef.us-east-1.rds.amazonaws.com",
+    "port": 3306
+  },
+  "region": "us-east-1",
+  "db_type": "mysql"
+}

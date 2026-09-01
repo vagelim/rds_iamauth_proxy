@@ -13,7 +13,6 @@ use config::File;
 use eyre::{eyre, Result};
 use futures::SinkExt;
 use memchr::memchr;
-use postgres_native_tls::TlsStream;
 use tokio::io::split;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -25,10 +24,20 @@ use tracing::{debug, info};
 use tracing_subscriber::filter::EnvFilter;
 
 mod backend_config;
+mod mysql_backend;
 use backend_config::BackendConfig;
+use backend_config::BackendStream;
 use backend_config::DbSpec;
+use backend_config::DbType;
 
 fn setup() -> Result<()> {
+    // Install the ring crypto provider for rustls before anything else uses it.
+    // This is required because multiple crates (our TLS code, aws-sdk-signin)
+    // depend on rustls but with different feature flags.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls ring crypto provider");
+
     if std::env::var("RUST_LIB_BACKTRACE").is_err() {
         std::env::set_var("RUST_LIB_BACKTRACE", "1")
     }
@@ -98,10 +107,89 @@ fn parse_startup(src: Bytes) -> Result<DbSpec> {
     Ok(db)
 }
 
+/// Send a PostgreSQL ErrorResponse to the client.
+async fn send_pg_error(
+    framed: &mut tokio_util::codec::Framed<&mut TcpStream, BytesCodec>,
+    code: &str,
+    message: &str,
+) -> Result<()> {
+    use bytes::BufMut;
+    let mut buf = bytes::BytesMut::new();
+    let severity = b"ERROR";
+    let body_len = 1 + severity.len() + 1
+        + 1 + code.len() + 1
+        + 1 + message.len() + 1
+        + 1;
+    buf.put_u8(b'E');
+    buf.put_i32((body_len + 4) as i32);
+    buf.put_u8(b'S');
+    buf.put_slice(severity);
+    buf.put_u8(0);
+    buf.put_u8(b'C');
+    buf.put_slice(code.as_bytes());
+    buf.put_u8(0);
+    buf.put_u8(b'M');
+    buf.put_slice(message.as_bytes());
+    buf.put_u8(0);
+    buf.put_u8(0);
+    framed.send(buf.freeze()).await?;
+    Ok(())
+}
+
+/// Ask the PostgreSQL client for a cleartext password and verify it against
+/// the configured local_password.
+async fn verify_pg_local_password(
+    framed: &mut tokio_util::codec::Framed<&mut TcpStream, BytesCodec>,
+    expected: &str,
+) -> Result<()> {
+    use bytes::BufMut;
+
+    // Send AuthenticationCleartextPassword: 'R' + int32(8) + int32(3)
+    let mut auth_req = bytes::BytesMut::with_capacity(9);
+    auth_req.put_u8(b'R');
+    auth_req.put_i32(8);
+    auth_req.put_i32(3);
+    framed.send(auth_req.freeze()).await?;
+
+    // Read PasswordMessage: 'p' + int32(len) + string\0
+    let resp = framed
+        .try_next()
+        .await?
+        .ok_or_else(|| eyre!("Client closed before sending password"))?;
+
+    if resp.is_empty() || resp[0] != b'p' {
+        send_pg_error(framed, "28P01", "Expected password message").await?;
+        return Err(eyre!("Expected PasswordMessage, got {:?}", resp.first()));
+    }
+
+    if resp.len() < 5 {
+        send_pg_error(framed, "28P01", "Malformed password message").await?;
+        return Err(eyre!("Password message too short"));
+    }
+
+    let password_bytes = &resp[5..];
+    let password = if password_bytes.last() == Some(&0) {
+        &password_bytes[..password_bytes.len() - 1]
+    } else {
+        password_bytes
+    };
+
+    let password_str = std::str::from_utf8(password)
+        .map_err(|_| eyre!("Password is not valid UTF-8"))?;
+
+    if password_str != expected {
+        send_pg_error(framed, "28P01", "Invalid local proxy password").await?;
+        return Err(eyre!("Local password mismatch"));
+    }
+
+    info!("Local password verified");
+    Ok(())
+}
+
 async fn auth_backend(
     config: &BackendConfig,
     client: &mut TcpStream,
-) -> Result<TlsStream<TcpStream>> {
+) -> Result<BackendStream> {
     let mut framed = BytesCodec::new().framed(client);
     while let Some(message) = framed.next().await {
         match message {
@@ -122,6 +210,12 @@ async fn auth_backend(
                             ));
                         }
                         let db = parse_startup(bytes.split_off(8).freeze())?;
+
+                        // Verify local password if configured
+                        if let Some(expected) = config.local_password() {
+                            verify_pg_local_password(&mut framed, expected).await?;
+                        }
+
                         let server = config.get_server_conn(db).await?;
                         return Ok(server);
                     } else {
@@ -159,21 +253,48 @@ async fn handle_client(
     Ok(())
 }
 
+/// Handle a MySQL client connection by delegating to the MySQL backend module.
+async fn handle_mysql_client(
+    config: &BackendConfig,
+    client: TcpStream,
+    _addr: SocketAddr,
+    connection_id: u32,
+) -> Result<()> {
+    mysql_backend::mysql_handle_client(config, client, connection_id).await
+}
+
 async fn run_proxy(config: BackendConfig, listen_address: &str) -> Result<()> {
     let listener = TcpListener::bind(listen_address).await?;
-    info!("Listening on {listen_address}");
+    let is_mysql = *config.db_type() == DbType::Mysql;
+    let protocol = if is_mysql { "MySQL" } else { "PostgreSQL" };
+    info!("Listening on {listen_address} ({protocol} mode)");
+
+    let connection_counter = std::sync::atomic::AtomicU32::new(1);
+
     loop {
         let (stream, addr) = listener.accept().await?;
 
-        info!("Got connection");
+        info!("Got connection from {addr}");
         let config_copy = config.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(&config_copy, stream, addr).await {
-                info!("An error occurred in a client {:?}", e);
-            } else {
-                info!("done with client");
-            }
-        });
+
+        if is_mysql {
+            let conn_id = connection_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::spawn(async move {
+                if let Err(e) = handle_mysql_client(&config_copy, stream, addr, conn_id).await {
+                    info!("MySQL client error: {:?}", e);
+                } else {
+                    info!("MySQL client disconnected");
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = handle_client(&config_copy, stream, addr).await {
+                    info!("PostgreSQL client error: {:?}", e);
+                } else {
+                    info!("PostgreSQL client disconnected");
+                }
+            });
+        }
     }
 }
 
@@ -194,19 +315,26 @@ async fn main() -> Result<()> {
         .author("Greg Soltis <greg@goldfiglabs.com")
         .arg(arg!(-c --config <CONFIG> "Sets the proxy config file to use").default_value("proxy"))
         .arg(
-            arg!(-l --listen <LISTEN> "Sets the address to listen on")
-                .default_value("127.0.0.1:5435"),
+            arg!(-l --listen <LISTEN> "Sets the address to listen on (default: 127.0.0.1:5435 for postgres, 127.0.0.1:3435 for mysql)")
+                .required(false),
         )
         .get_matches();
 
     let config_file = matches.get_one::<String>("config").unwrap();
-    let listen_address = matches.get_one::<String>("listen").unwrap();
-
     let backend_config = load_config(config_file)?;
+
+    let default_listen = match backend_config.db_type() {
+        DbType::Mysql => "127.0.0.1:3435".to_string(),
+        DbType::Postgres => "127.0.0.1:5435".to_string(),
+    };
+    let listen_address = matches
+        .get_one::<String>("listen")
+        .cloned()
+        .unwrap_or(default_listen);
 
     // Run the proxy until we either get a Ctrl-C event or the proxy fails
     tokio::select! {
-        _ = run_proxy(backend_config, listen_address) => {}
+        _ = run_proxy(backend_config, &listen_address) => {}
         _ = signal::ctrl_c() => {}
     }
 
